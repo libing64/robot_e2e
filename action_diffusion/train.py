@@ -52,6 +52,7 @@ def run_training(
     sample = train_set[0]
     obs_dim = int(sample["obs"].shape[-1])
     action_dim = int(sample["action"].shape[-1])
+    image_size = int(sample["image"].shape[-1]) if "image" in sample else 0
     stats = stats_from_frames(train_set.obs_frames, train_set.action_frames)
 
     policy = DiffusionPolicy(
@@ -63,13 +64,14 @@ def run_training(
         down_dims=down_dims,
         num_train_timesteps=num_train_timesteps,
         num_inference_steps=num_inference_steps,
+        image_size=image_size,
     )
     policy.set_normalizer(stats["obs_min"], stats["obs_max"], stats["action_min"], stats["action_max"])
     policy.to(device_t)
 
     n_params = sum(p.numel() for p in policy.parameters())
     print(
-        f"obs_dim={obs_dim} action_dim={action_dim} "
+        f"obs_dim={obs_dim} action_dim={action_dim} image_size={image_size} "
         f"train_windows={len(train_set)} val_windows={len(val_set)} params={n_params/1e6:.2f}M"
     )
 
@@ -119,7 +121,8 @@ def run_training(
         for batch in tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}", leave=False):
             obs = batch["obs"].to(device_t, non_blocking=True)
             action = batch["action"].to(device_t, non_blocking=True)
-            loss = policy.loss(obs, action)
+            image = batch["image"].to(device_t, non_blocking=True) if "image" in batch else None
+            loss = policy.loss(obs, action, image)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
@@ -162,7 +165,8 @@ def _evaluate(model: DiffusionPolicy, loader: DataLoader, device: torch.device) 
     for batch in loader:
         obs = batch["obs"].to(device, non_blocking=True)
         action = batch["action"].to(device, non_blocking=True)
-        loss = model.loss(obs, action)
+        image = batch["image"].to(device, non_blocking=True) if "image" in batch else None
+        loss = model.loss(obs, action, image)
         total += loss.item() * obs.shape[0]
         count += obs.shape[0]
     model.train()
@@ -174,7 +178,8 @@ def _print_sample(model: DiffusionPolicy, dataset, device: torch.device) -> None
     model.eval()
     batch = dataset[0]
     obs = batch["obs"].unsqueeze(0).to(device)
-    pred = model.sample(obs)
+    image = batch["image"].unsqueeze(0).to(device) if "image" in batch else None
+    pred = model.sample(obs, image)
     action = pred["action"][0, 0].detach().cpu().numpy()
     target = batch["action"][model.obs_horizon - 1].numpy()
     print("sample action[0]", np.array2string(action, precision=2, suppress_small=True))

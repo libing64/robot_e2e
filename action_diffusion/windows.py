@@ -82,6 +82,7 @@ class WindowDataset(Dataset):
         pred_horizon: int,
         obs_horizon: int,
         action_horizon: int,
+        images: np.ndarray | None = None,
     ):
         if len(obs) != len(action):
             raise ValueError(f"obs/action length mismatch: {len(obs)} vs {len(action)}")
@@ -89,8 +90,11 @@ class WindowDataset(Dataset):
             raise ValueError(
                 f"episode_ends[-1]={episode_ends[-1]} does not match frame count {len(obs)}"
             )
+        if images is not None and len(images) != len(obs):
+            raise ValueError(f"image/obs length mismatch: {len(images)} vs {len(obs)}")
         self.obs = np.asarray(obs, dtype=np.float32)
         self.action = np.asarray(action, dtype=np.float32)
+        self.images = images
         self.pred_horizon = pred_horizon
         self.obs_horizon = obs_horizon
         self.action_horizon = action_horizon
@@ -123,7 +127,14 @@ class WindowDataset(Dataset):
             self.action, int(buffer_start), int(buffer_end),
             int(out_start), int(out_end), self.pred_horizon,
         )
-        return {
+        item = {
             "obs": torch.from_numpy(np.ascontiguousarray(obs)),
             "action": torch.from_numpy(np.ascontiguousarray(action)),
         }
+        if self.images is not None:
+            image = _pad_window(
+                self.images, int(buffer_start), int(buffer_end),
+                int(out_start), int(out_end), self.pred_horizon,
+            )[: self.obs_horizon]
+            item["image"] = torch.from_numpy(np.array(image, copy=True)).permute(0, 3, 1, 2)
+        return item

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from action_diffusion.gaussian import GaussianDiffusion
 from action_diffusion.unet1d import ConditionalUnet1D
+from action_diffusion.vision import ImageEncoder
 
 
 class DiffusionPolicy(nn.Module):
@@ -25,6 +26,8 @@ class DiffusionPolicy(nn.Module):
         num_train_timesteps: int = 100,
         num_inference_steps: int = 16,
         kernel_size: int = 5,
+        image_size: int = 0,
+        image_feature_dim: int = 128,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -34,9 +37,15 @@ class DiffusionPolicy(nn.Module):
         self.action_horizon = action_horizon
         self.num_inference_steps = num_inference_steps
         self.down_dims = list(down_dims)
+        self.image_size = image_size
+        self.image_feature_dim = image_feature_dim
+        self.encoder = ImageEncoder(image_feature_dim, image_size) if image_size else None
+        cond_dim = obs_dim * obs_horizon
+        if image_size:
+            cond_dim += image_feature_dim * obs_horizon
         self.unet = ConditionalUnet1D(
             input_dim=action_dim,
-            global_cond_dim=obs_dim * obs_horizon,
+            global_cond_dim=cond_dim,
             down_dims=self.down_dims,
             kernel_size=kernel_size,
         )
@@ -58,29 +67,52 @@ class DiffusionPolicy(nn.Module):
     def _unnormalize(self, x: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
         return (x + 1.0) / 2.0 * (hi - lo) + lo
 
-    def _global_cond(self, obs: torch.Tensor) -> torch.Tensor:
+    def _encode_images(self, image: torch.Tensor) -> torch.Tensor:
+        if self.encoder is None:
+            raise ValueError("this checkpoint has no image encoder")
+        if image.ndim != 5 or image.shape[1] < self.obs_horizon:
+            raise ValueError(
+                f"expected image (B, >= {self.obs_horizon}, 3, H, W), got {tuple(image.shape)}"
+            )
+        frames = image[:, : self.obs_horizon]
+        if frames.dtype == torch.uint8:
+            frames = frames.float() / 255.0
+        batch, steps, channels, height, width = frames.shape
+        if channels != 3 or height != self.image_size or width != self.image_size:
+            raise ValueError(
+                f"expected image (B, T, 3, {self.image_size}, {self.image_size}), got {tuple(image.shape)}"
+            )
+        flat = frames.reshape(batch * steps, channels, height, width)
+        flat = flat * 2.0 - 1.0
+        features = self.encoder(flat).reshape(batch, steps, self.image_feature_dim)
+        return features.flatten(1)
+
+    def _global_cond(self, obs: torch.Tensor, image: torch.Tensor | None = None) -> torch.Tensor:
         if obs.ndim != 3 or obs.shape[1] < self.obs_horizon or obs.shape[-1] != self.obs_dim:
             raise ValueError(
                 f"expected obs (B, >= {self.obs_horizon}, {self.obs_dim}), got {tuple(obs.shape)}"
             )
         nobs = self._normalize(obs[:, : self.obs_horizon], self.obs_min, self.obs_max)
-        return nobs.flatten(1)
+        cond = nobs.flatten(1)
+        if self.encoder is not None:
+            cond = torch.cat((cond, self._encode_images(image)), dim=-1)
+        return cond
 
-    def loss(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def loss(self, obs: torch.Tensor, action: torch.Tensor, image: torch.Tensor | None = None) -> torch.Tensor:
         naction = self._normalize(action, self.action_min, self.action_max)
         noise = torch.randn_like(naction)
         timesteps = torch.randint(
             0, self.diffusion.num_train_timesteps, (naction.shape[0],), device=naction.device
         )
         noisy = self.diffusion.add_noise(naction, noise, timesteps)
-        pred = self.unet(noisy, timesteps, self._global_cond(obs))
+        pred = self.unet(noisy, timesteps, self._global_cond(obs, image))
         return F.mse_loss(pred, noise)
 
     @torch.no_grad()
-    def sample(self, obs: torch.Tensor, steps: int | None = None) -> dict[str, torch.Tensor]:
+    def sample(self, obs: torch.Tensor, image: torch.Tensor | None = None, steps: int | None = None) -> dict[str, torch.Tensor]:
         """Denoise an action sequence. ``action`` is the slice the controller should execute."""
         steps = self.num_inference_steps if steps is None else steps
-        cond = self._global_cond(obs)
+        cond = self._global_cond(obs, image)
         naction = self.diffusion.ddim_sample(
             self.unet,
             shape=(obs.shape[0], self.pred_horizon, self.action_dim),
@@ -103,6 +135,8 @@ class DiffusionPolicy(nn.Module):
             "down_dims": self.down_dims,
             "num_train_timesteps": self.diffusion.num_train_timesteps,
             "num_inference_steps": self.num_inference_steps,
+            "image_size": self.image_size,
+            "image_feature_dim": self.image_feature_dim,
         }
 
 
